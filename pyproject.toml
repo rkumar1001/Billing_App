@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "billing-app"
+version = "0.1.0"
+description = "Generic invoice duplicator desktop app"
+requires-python = ">=3.11"
+dependencies = [
+    "customtkinter>=5.2",
+    "tkcalendar>=1.6",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "SQLAlchemy>=2.0",
+    "platformdirs>=4.3",
+]
+
+[project.scripts]
+billing-app = "billing_app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+billing_app = ["../assets/*"]

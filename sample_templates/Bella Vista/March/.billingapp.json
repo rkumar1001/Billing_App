@@ -1,0 +1,41 @@
+{
+  "excel": {
+    "sheet": "Breakdown",
+    "month_number_cell": "K2",
+    "invoice_date_cell": "K3",
+    "dates_column_start": "B6",
+    "dates_row_end": 36
+  },
+  "word": {
+    "invoice_number": {
+      "table": 0,
+      "row": 0,
+      "col": 1,
+      "paragraph": 0
+    },
+    "invoice_date": {
+      "table": 0,
+      "row": 1,
+      "col": 1,
+      "paragraph": 0
+    },
+    "billing_period": {
+      "table": 1,
+      "row": 1,
+      "col": 2,
+      "paragraph": 0
+    },
+    "total_hours": {
+      "table": 1,
+      "row": 1,
+      "col": 4,
+      "paragraph": 0
+    },
+    "grand_total": {
+      "table": 2,
+      "row": 1,
+      "col": 1,
+      "paragraph": 0
+    }
+  }
+}
