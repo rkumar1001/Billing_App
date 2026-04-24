@@ -35,6 +35,7 @@ class FolderAnalysis:
     invoice_prefix: str = ""
     invoice_number: int | None = None
     folder_month_token: str = ""  # e.g. "March" — token we'll swap in filenames
+    excel_is_legacy_xls: bool = False
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -44,7 +45,7 @@ class FolderAnalysis:
     def missing(self) -> list[str]:
         out: list[str] = []
         if not self.excel_path:
-            out.append("Excel file (.xlsx)")
+            out.append("Excel file (.xlsx or .xls)")
         if not self.word_path:
             out.append("Word file (.docx)")
         if self.invoice_number is None:
@@ -60,7 +61,10 @@ def analyze(folder: Path) -> FolderAnalysis:
         return result
 
     # Only look at top-level files. Subfolders (Attachments/, Documents/) ride
-    # along during copy but never get edited.
+    # along during copy but never get edited. PDFs are silently ignored —
+    # they're typically stale exports, and PDF generation is now an explicit
+    # user-triggered action.
+    legacy_candidate: Path | None = None
     for item in folder.iterdir():
         if not item.is_file():
             continue
@@ -68,11 +72,18 @@ def analyze(folder: Path) -> FolderAnalysis:
         if lower.endswith(".xlsx") or lower.endswith(".xlsm"):
             if result.excel_path is None:
                 result.excel_path = item
+                result.excel_is_legacy_xls = False
             else:
                 result.extra_files.append(item)
                 result.warnings.append(
                     f"multiple Excel files found; using {result.excel_path.name}"
                 )
+        elif lower.endswith(".xls"):
+            # Defer: prefer a proper .xlsx if one exists in the same folder.
+            if legacy_candidate is None:
+                legacy_candidate = item
+            else:
+                result.extra_files.append(item)
         elif lower.endswith(".docx"):
             if result.word_path is None:
                 result.word_path = item
@@ -81,8 +92,17 @@ def analyze(folder: Path) -> FolderAnalysis:
                 result.warnings.append(
                     f"multiple Word files found; using {result.word_path.name}"
                 )
+        elif lower.endswith(".pdf"):
+            # Ignore PDF exports entirely. Not recorded in extra_files so they
+            # don't appear in unresolved-item warnings.
+            continue
         else:
             result.extra_files.append(item)
+
+    # Promote the .xls candidate only if no .xlsx was found.
+    if result.excel_path is None and legacy_candidate is not None:
+        result.excel_path = legacy_candidate
+        result.excel_is_legacy_xls = True
 
     # Detect invoice number / prefix from the Word filename.
     if result.word_path is not None:

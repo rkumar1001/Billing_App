@@ -6,7 +6,7 @@ import subprocess
 import traceback
 from datetime import date, datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 from typing import TYPE_CHECKING
 
 import customtkinter as ctk
@@ -20,6 +20,13 @@ from ..services.invoice_generator import (
     generate,
     preview,
 )
+from ..services.pdf_export import (
+    PdfExportError,
+    export_to_pdf,
+    install_hint as pdf_install_hint,
+    pdf_backend_available,
+)
+from .dialogs import ask_directory
 from .cell_picker import ExcelCellPicker, WordLocationPicker
 
 if TYPE_CHECKING:
@@ -49,6 +56,8 @@ class GeneratorScreen(ctk.CTkFrame):
         self._analysis: FolderAnalysis | None = None
         self._excel_det: ExcelDetection | None = None
         self._word_det: WordDetection | None = None
+        self._last_target_folder: Path | None = None
+        self._last_generated_files: list[Path] = []
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -187,17 +196,31 @@ class GeneratorScreen(ctk.CTkFrame):
             variable=self._overwrite_var,
         ).grid(row=grow(), column=0, columnspan=2, sticky="w", padx=8, pady=(12, 4))
 
+        # PDF toggle.
+        initial_pdf = bool(getattr(self.app.cfg, "generate_pdf_on_export", False))
+        self._pdf_toggle_var = ctk.BooleanVar(value=initial_pdf)
+        ctk.CTkSwitch(
+            f, text="Also export PDFs on Generate",
+            variable=self._pdf_toggle_var,
+            command=self._on_pdf_toggle,
+        ).grid(row=grow(), column=0, columnspan=2, sticky="w", padx=8, pady=(4, 4))
+
         # Buttons.
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
         btn_row.grid(row=grow(), column=0, columnspan=2, sticky="ew", padx=8, pady=(16, 6))
         ctk.CTkButton(
             btn_row, text="Re-detect fields", command=self._refresh_analysis,
-            fg_color="transparent", border_width=1, width=160,
+            fg_color="transparent", border_width=1, width=140,
         ).pack(side="left")
         self._generate_btn = ctk.CTkButton(
-            btn_row, text="Generate", command=self._generate, height=38, width=160,
+            btn_row, text="Generate", command=self._generate, height=38, width=140,
         )
         self._generate_btn.pack(side="right")
+        self._pdf_btn = ctk.CTkButton(
+            btn_row, text="Generate PDF", command=self._generate_pdf_only,
+            height=38, width=140, state="disabled",
+        )
+        self._pdf_btn.pack(side="right", padx=(0, 8))
 
     def _build_preview(self) -> None:
         p = self._preview
@@ -219,7 +242,7 @@ class GeneratorScreen(ctk.CTkFrame):
             self._preview_lines[key] = lbl
 
         self._warning_box = ctk.CTkLabel(
-            p, text="", text_color=("red", "#ff8080"), anchor="w", justify="left",
+            p, text="", text_color=("gray35", "gray75"), anchor="w", justify="left",
             wraplength=440, font=ctk.CTkFont(size=11),
         )
         self._warning_box.grid(row=50, column=0, sticky="ew", padx=14, pady=(12, 4))
@@ -233,8 +256,10 @@ class GeneratorScreen(ctk.CTkFrame):
     # ---- events ------------------------------------------------------
 
     def _pick_source_folder(self) -> None:
-        start = self._folder_var.get() or self.app.cfg.default_output_root
-        folder = filedialog.askdirectory(initialdir=start or None)
+        start = (self._folder_var.get() or self.app.cfg.default_output_root or "").strip()
+        initialdir = start if Path(start).is_dir() else None
+        parent = self.winfo_toplevel()
+        folder = ask_directory(parent=parent, initialdir=initialdir, title="Choose source folder")
         if folder:
             self._folder_var.set(folder)
 
@@ -291,9 +316,15 @@ class GeneratorScreen(ctk.CTkFrame):
 
         parts: list[str] = []
         if analysis.excel_path:
-            parts.append(f"Excel: {analysis.excel_path.name}")
+            if analysis.excel_is_legacy_xls:
+                parts.append(
+                    f"Excel: {analysis.excel_path.name}  (legacy .xls — "
+                    f"will be converted to .xlsx in the new folder)"
+                )
+            else:
+                parts.append(f"Excel: {analysis.excel_path.name}")
         else:
-            parts.append("No Excel (.xlsx) found")
+            parts.append("No Excel (.xlsx or .xls) found")
         if analysis.word_path:
             parts.append(f"Word: {analysis.word_path.name}")
         else:
@@ -325,17 +356,18 @@ class GeneratorScreen(ctk.CTkFrame):
             excel_missing = self._excel_det.missing_fields()
             if excel_missing:
                 warnings.append(
-                    "Excel fields we couldn't auto-detect: "
+                    "Some Excel fields need manual selection: "
                     + ", ".join(excel_missing)
-                    + " — click 'Re-detect fields' or use the Picker buttons below."
+                    + ". Use the Picker buttons below, or fill in the "
+                    "Overrides fields manually."
                 )
         if self._word_det:
             word_missing = self._word_det.missing_fields()
             if word_missing:
                 warnings.append(
-                    "Word fields we couldn't auto-detect: "
+                    "Some Word fields need manual selection: "
                     + ", ".join(word_missing)
-                    + " — use the Picker buttons below."
+                    + ". Use the Picker buttons below."
                 )
         if not (self._excel_det and self._word_det):
             warnings.append("Select a source folder to begin.")
@@ -523,10 +555,23 @@ class GeneratorScreen(ctk.CTkFrame):
         if result.unresolved_excel or result.unresolved_word:
             lines.append("")
             lines.append(
-                "⚠ Some fields couldn't be updated because we didn't know where they live: "
+                "Some fields couldn't be updated because we didn't know where they live: "
                 + ", ".join(result.unresolved_excel + result.unresolved_word)
                 + ". Use the picker buttons, then re-generate."
             )
+
+        # Remember the target so the Generate-PDF button can operate on it.
+        self._last_target_folder = result.copied_folder
+        self._last_generated_files = [p for p in (result.excel_path, result.word_path) if p]
+        self._pdf_btn.configure(state="normal")
+
+        # Run PDF export inline if the toggle is on.
+        if self._pdf_toggle_var.get() and self._last_generated_files:
+            pdf_lines = self._run_pdf_export(self._last_generated_files, result.copied_folder)
+            if pdf_lines:
+                lines.append("")
+                lines.extend(pdf_lines)
+
         self._result_box.configure(text="\n".join(lines))
 
         if messagebox.askyesno(
@@ -535,6 +580,46 @@ class GeneratorScreen(ctk.CTkFrame):
             parent=self,
         ):
             open_in_os(result.copied_folder)
+
+    def _on_pdf_toggle(self) -> None:
+        self.app.cfg.generate_pdf_on_export = bool(self._pdf_toggle_var.get())  # type: ignore[attr-defined]
+        self.app.save_config()
+
+    def _generate_pdf_only(self) -> None:
+        if not self._last_target_folder or not self._last_generated_files:
+            messagebox.showinfo(
+                "Generate first",
+                "Click Generate to create the next month's folder first, "
+                "then use this button to export PDFs from it.",
+                parent=self,
+            )
+            return
+        lines = self._run_pdf_export(self._last_generated_files, self._last_target_folder)
+        if lines:
+            existing = self._result_box.cget("text") or ""
+            self._result_box.configure(text=existing + "\n\n" + "\n".join(lines))
+
+    def _run_pdf_export(self, files: list[Path], out_dir: Path) -> list[str]:
+        if not pdf_backend_available():
+            messagebox.showinfo(
+                "PDF export unavailable",
+                pdf_install_hint(),
+                parent=self,
+            )
+            return [f"PDF skipped — {pdf_install_hint()}"]
+        try:
+            r = export_to_pdf(files, out_dir)
+        except PdfExportError as e:
+            messagebox.showerror("PDF export failed", str(e), parent=self)
+            return [f"PDF export failed: {e}"]
+        if not r.generated:
+            return ["PDF export produced no files."]
+        backend_name = {"msoffice": "MS Office", "libreoffice": "LibreOffice"}.get(
+            r.backend, r.backend,
+        )
+        return [f"Exported PDFs (via {backend_name}):"] + [
+            f"  {p.name}" for p in r.generated
+        ]
 
 
 def _parse_float(raw: str, fallback):

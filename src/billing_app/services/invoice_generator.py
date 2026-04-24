@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from docx import Document
+from docx.oxml.ns import qn
 from openpyxl import load_workbook
 from openpyxl.utils.cell import coordinate_from_string
 
@@ -31,6 +32,7 @@ from .auto_detect import (
     ExcelDetection,
     WordDetection,
     WordLoc,
+    convert_xls_to_xlsx,
     detect_excel,
     detect_word,
     load_cache,
@@ -157,6 +159,16 @@ def generate(req: GenerateRequest) -> GenerateResult:
 
     shutil.copytree(source, target_folder)
 
+    # Drop any stale PDF exports copied over from the source folder — PDFs
+    # are now generated on demand, so keeping the previous month's versions
+    # would be misleading.
+    for item in target_folder.iterdir():
+        if item.is_file() and item.suffix.lower() == ".pdf":
+            try:
+                item.unlink()
+            except OSError:
+                pass
+
     # Determine next invoice number.
     invoice_int = (
         req.explicit_invoice_number
@@ -164,22 +176,45 @@ def generate(req: GenerateRequest) -> GenerateResult:
         else analysis.next_invoice_number
     )
 
+    # If the source folder carries a legacy .xls, upgrade it to .xlsx inside
+    # the target folder before we do anything else. The original .xls in the
+    # source stays untouched; the target-folder .xls is replaced by an
+    # equivalent .xlsx that the rest of the pipeline can edit.
+    if analysis.excel_is_legacy_xls and analysis.excel_path is not None:
+        legacy_in_target = target_folder / analysis.excel_path.name
+        if legacy_in_target.exists():
+            new_path_in_target = legacy_in_target.with_suffix(".xlsx")
+            convert_xls_to_xlsx(legacy_in_target, new_path_in_target)
+            try:
+                legacy_in_target.unlink()
+            except OSError:
+                pass
+            # Point the analysis at the new .xlsx in the target folder; every
+            # subsequent step (rename_for_target, detect_excel, _update_excel)
+            # operates on this file.
+            analysis.excel_path = new_path_in_target
+
     new_excel, new_word = rename_for_target(
         analysis, target_folder, req.target_month, req.target_year, invoice_int,
     )
 
     # Resolve detection: overrides > cache > fresh detection.
+    # For detection we read whichever Excel/Word file is currently in the
+    # target folder (handles the legacy-xls conversion and post-rename paths
+    # transparently).
     cache = load_cache(source)
     excel_det = req.excel_overrides or (cache.excel if cache else None)
-    if excel_det is None and analysis.excel_path:
-        excel_det = detect_excel(analysis.excel_path)
+    excel_for_detect = new_excel or analysis.excel_path
+    if excel_det is None and excel_for_detect is not None:
+        excel_det = detect_excel(excel_for_detect)
     if excel_det is None:
         excel_det = ExcelDetection()
 
     word_det = req.word_overrides or (cache.word if cache else None)
-    if word_det is None and analysis.word_path and analysis.invoice_number is not None:
+    word_for_detect = new_word or analysis.word_path
+    if word_det is None and word_for_detect is not None and analysis.invoice_number is not None:
         word_det = detect_word(
-            analysis.word_path,
+            word_for_detect,
             f"{analysis.invoice_prefix}{analysis.invoice_number}",
         )
     if word_det is None:
@@ -332,6 +367,11 @@ def _update_word(
     unresolved: list[str] = []
     doc = Document(str(path))
 
+    # Gather leaf paragraphs (the same set the detector used). Skipping
+    # container <w:p> wrappers means we don't accidentally also rewrite a
+    # super-paragraph that encloses text frames.
+    leaf_paragraphs = list(_leaf_paragraph_elements(doc))
+
     for field_name in ("invoice_number", "invoice_date", "billing_period",
                        "total_hours", "grand_total"):
         loc: WordLoc | None = getattr(det, field_name)
@@ -339,18 +379,28 @@ def _update_word(
         if loc is None:
             unresolved.append(field_name)
             continue
-        try:
-            cell = doc.tables[loc.table_index].rows[loc.row].cells[loc.col]
-        except IndexError:
+        if loc.match_text:
+            # Modern path: text-based find-and-replace.
+            if not _replace_match_in_paragraphs(
+                leaf_paragraphs, loc.match_text, value,
+            ):
+                unresolved.append(field_name)
+        elif loc.table_index >= 0:
+            # Legacy path for cached .billingapp.json files from older
+            # versions — fall back to cell-based editing.
+            try:
+                cell = doc.tables[loc.table_index].rows[loc.row].cells[loc.col]
+                _set_cell_text_legacy(cell, value, loc.paragraph_index)
+            except IndexError:
+                unresolved.append(field_name)
+        else:
             unresolved.append(field_name)
-            continue
-        _set_cell_text(cell, value, loc.paragraph_index)
 
     doc.save(str(path))
     return unresolved
 
 
-def _set_cell_text(cell, text: str, paragraph_index: int = 0) -> None:
+def _set_cell_text_legacy(cell, text: str, paragraph_index: int = 0) -> None:
     if paragraph_index >= len(cell.paragraphs):
         paragraph_index = 0
     paragraph = cell.paragraphs[paragraph_index]
@@ -360,6 +410,75 @@ def _set_cell_text(cell, text: str, paragraph_index: int = 0) -> None:
             extra.text = ""
     else:
         paragraph.add_run(text)
+
+
+def _leaf_paragraph_elements(doc) -> list:
+    """Return leaf <w:p> elements — paragraphs without nested <w:p>, matching
+    what auto_detect walks over."""
+    p_tag = qn("w:p")
+    out = []
+    for p in doc.element.body.iter(p_tag):
+        has_nested = False
+        for child in p.iter(p_tag):
+            if child is not p:
+                has_nested = True
+                break
+        if not has_nested:
+            out.append(p)
+    return out
+
+
+def _replace_match_in_paragraphs(paragraphs, old: str, new: str) -> bool:
+    """Replace every occurrence of `old` with `new` across run boundaries in
+    any of the given paragraphs. Returns True if at least one replacement
+    was made.
+    """
+    if not old:
+        return False
+    t_tag = qn("w:t")
+    any_replaced = False
+    for p in paragraphs:
+        runs = list(p.iter(t_tag))
+        if not runs:
+            continue
+        # Keep replacing until the joined text no longer contains `old`; this
+        # lets us catch duplicated layouts that include the same value twice.
+        while True:
+            joined = "".join((t.text or "") for t in runs)
+            idx = joined.find(old)
+            if idx < 0:
+                break
+            end = idx + len(old)
+            _splice_runs(runs, idx, end, new)
+            any_replaced = True
+    return any_replaced
+
+
+def _splice_runs(runs, start: int, end: int, new: str) -> None:
+    """Rewrite the given <w:t> run elements so that the joined character range
+    [start, end) is replaced with `new`. Runs outside the range are
+    untouched; runs fully inside are emptied; boundary runs keep their
+    unaffected portions.
+    """
+    cursor = 0
+    replaced = False
+    for t in runs:
+        txt = t.text or ""
+        r_start = cursor
+        r_end = cursor + len(txt)
+        cursor = r_end
+        if r_end <= start or r_start >= end:
+            continue  # no overlap
+        local_start = max(0, start - r_start)
+        local_end = min(len(txt), end - r_start)
+        prefix = txt[:local_start]
+        suffix = txt[local_end:]
+        if not replaced:
+            t.text = prefix + new + suffix
+            replaced = True
+        else:
+            # Middle / tail runs: keep only the portion outside the match.
+            t.text = prefix + suffix
 
 
 def _format_period(year: int, month: int) -> str:

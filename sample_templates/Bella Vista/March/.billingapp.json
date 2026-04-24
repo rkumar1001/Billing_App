@@ -4,37 +4,53 @@
     "month_number_cell": "K2",
     "invoice_date_cell": "K3",
     "dates_column_start": "B6",
-    "dates_row_end": 36
+    "dates_row_end": 36,
+    "legacy_xls": false
   },
   "word": {
     "invoice_number": {
-      "table": 0,
+      "paragraph_order": 1,
+      "old_text": "Bella16",
+      "match_text": "Bella16",
+      "table": -1,
       "row": 0,
-      "col": 1,
+      "col": 0,
       "paragraph": 0
     },
     "invoice_date": {
-      "table": 0,
-      "row": 1,
-      "col": 1,
+      "paragraph_order": 3,
+      "old_text": "March 6, 2026",
+      "match_text": "March 6, 2026",
+      "table": -1,
+      "row": 0,
+      "col": 0,
       "paragraph": 0
     },
     "billing_period": {
-      "table": 1,
-      "row": 1,
-      "col": 2,
+      "paragraph_order": 25,
+      "old_text": "3/1/2026 \u2013 3/31/2026",
+      "match_text": "3/1/2026 \u2013 3/31/2026",
+      "table": -1,
+      "row": 0,
+      "col": 0,
       "paragraph": 0
     },
     "total_hours": {
-      "table": 1,
-      "row": 1,
-      "col": 4,
+      "paragraph_order": 27,
+      "old_text": "308",
+      "match_text": "308",
+      "table": -1,
+      "row": 0,
+      "col": 0,
       "paragraph": 0
     },
     "grand_total": {
-      "table": 2,
-      "row": 1,
-      "col": 1,
+      "paragraph_order": 52,
+      "old_text": "$6,820",
+      "match_text": "$6,820",
+      "table": -1,
+      "row": 0,
+      "col": 0,
       "paragraph": 0
     }
   }

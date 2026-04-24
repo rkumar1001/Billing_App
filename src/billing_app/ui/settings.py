@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from tkinter import filedialog
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import customtkinter as ctk
+
+from .dialogs import ask_directory
 
 if TYPE_CHECKING:
     from .app import BillingApp
@@ -49,7 +51,10 @@ class SettingsScreen(ctk.CTkFrame):
         ).grid(row=2, column=0, sticky="w", padx=26, pady=(16, 6))
 
     def _pick_folder(self) -> None:
-        folder = filedialog.askdirectory(initialdir=self.out_var.get() or None)
+        start = (self.out_var.get() or "").strip()
+        initialdir = start if Path(start).is_dir() else None
+        parent = self.winfo_toplevel()
+        folder = ask_directory(parent=parent, initialdir=initialdir, title="Choose default folder")
         if folder:
             self.out_var.set(folder)
 

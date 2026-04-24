@@ -162,7 +162,12 @@ class WordLocationPicker(ctk.CTkToplevel):
                             text=label,
                             values=(paragraph.text[:80],),
                         )
-                        self._locations[iid] = WordLoc(t_idx, r_idx, c_idx, p_idx)
+                        self._locations[iid] = WordLoc(
+                            table_index=t_idx, row=r_idx, col=c_idx,
+                            paragraph_index=p_idx,
+                            old_text=paragraph.text,
+                            match_text=paragraph.text.strip(),
+                        )
 
         bottom = ctk.CTkFrame(self, fg_color="transparent")
         bottom.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 12))

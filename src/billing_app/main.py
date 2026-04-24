@@ -4,7 +4,7 @@ import sys
 
 
 def main() -> int:
-    from .ui.app import BillingApp
+    from billing_app.ui.app import BillingApp
     app = BillingApp()
     app.mainloop()
     return 0

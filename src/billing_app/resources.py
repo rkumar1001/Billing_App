@@ -16,6 +16,7 @@ class AppConfig:
     default_output_root: str = ""
     window_geometry: str = "1100x720"
     date_format: str = "%B %d, %Y"
+    generate_pdf_on_export: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
