@@ -20,12 +20,6 @@ from ..services.invoice_generator import (
     generate,
     preview,
 )
-from ..services.pdf_export import (
-    PdfExportError,
-    export_to_pdf,
-    install_hint as pdf_install_hint,
-    pdf_backend_available,
-)
 from .dialogs import ask_directory
 from .cell_picker import ExcelCellPicker, WordLocationPicker
 
@@ -56,8 +50,6 @@ class GeneratorScreen(ctk.CTkFrame):
         self._analysis: FolderAnalysis | None = None
         self._excel_det: ExcelDetection | None = None
         self._word_det: WordDetection | None = None
-        self._last_target_folder: Path | None = None
-        self._last_generated_files: list[Path] = []
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -126,9 +118,9 @@ class GeneratorScreen(ctk.CTkFrame):
         ).grid(row=0, column=1, padx=(6, 0))
 
         self._analysis_label = ctk.CTkLabel(
-            f, text="", wraplength=440, justify="left",
+            f, text="", wraplength=380, justify="left", anchor="w",
             font=ctk.CTkFont(size=11),
-            text_color=("gray30", "gray80"),
+            text_color=("gray20", "gray80"),
         )
         self._analysis_label.grid(row=grow(), column=0, columnspan=2, sticky="w", padx=8, pady=(2, 10))
 
@@ -146,17 +138,17 @@ class GeneratorScreen(ctk.CTkFrame):
         month_row.grid(row=grow(), column=0, columnspan=2, sticky="ew", padx=8, pady=2)
         ctk.CTkOptionMenu(
             month_row, variable=self._month_var, values=MONTH_NAMES,
-            command=lambda *_: self._recompute(),
+            command=lambda *_: self._recompute(), width=120,
         ).pack(side="left")
-        ctk.CTkEntry(month_row, textvariable=self._year_var, width=90).pack(side="left", padx=(8, 0))
+        ctk.CTkEntry(month_row, textvariable=self._year_var, width=70).pack(side="left", padx=(6, 0))
         ctk.CTkButton(
-            month_row, text="Next month", width=110,
+            month_row, text="Next", width=60,
             command=self._set_next_month,
-        ).pack(side="left", padx=(8, 0))
+        ).pack(side="left", padx=(6, 0))
         ctk.CTkButton(
-            month_row, text="Current month", width=120,
+            month_row, text="Today", width=60,
             command=self._set_current_month,
-        ).pack(side="left", padx=(8, 0))
+        ).pack(side="left", padx=(6, 0))
         self._year_var.trace_add("write", lambda *_: self._recompute())
 
         # Invoice date.
@@ -171,8 +163,9 @@ class GeneratorScreen(ctk.CTkFrame):
 
         # Optional overrides.
         ctk.CTkLabel(
-            f, text="Overrides (leave blank to use values detected from Excel)",
+            f, text="Overrides (optional — blank uses Excel values)",
             font=ctk.CTkFont(size=12, weight="bold"),
+            wraplength=380, justify="left",
         ).grid(row=grow(), column=0, columnspan=2, sticky="w", padx=8, pady=(12, 2))
         self._rate_var = ctk.StringVar()
         self._hpd_var = ctk.StringVar()
@@ -192,35 +185,27 @@ class GeneratorScreen(ctk.CTkFrame):
         # Overwrite checkbox.
         self._overwrite_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            f, text="Overwrite target folder if it already exists",
+            f, text="Overwrite target folder if it exists",
             variable=self._overwrite_var,
         ).grid(row=grow(), column=0, columnspan=2, sticky="w", padx=8, pady=(12, 4))
 
-        # PDF toggle.
-        initial_pdf = bool(getattr(self.app.cfg, "generate_pdf_on_export", False))
-        self._pdf_toggle_var = ctk.BooleanVar(value=initial_pdf)
-        ctk.CTkSwitch(
-            f, text="Also export PDFs on Generate",
-            variable=self._pdf_toggle_var,
-            command=self._on_pdf_toggle,
-        ).grid(row=grow(), column=0, columnspan=2, sticky="w", padx=8, pady=(4, 4))
-
         # Buttons.
         btn_row = ctk.CTkFrame(f, fg_color="transparent")
-        btn_row.grid(row=grow(), column=0, columnspan=2, sticky="ew", padx=8, pady=(16, 6))
-        ctk.CTkButton(
-            btn_row, text="Re-detect fields", command=self._refresh_analysis,
-            fg_color="transparent", border_width=1, width=140,
-        ).pack(side="left")
+        btn_row.grid(row=grow(), column=0, columnspan=2, sticky="ew", padx=8, pady=(16, 2))
         self._generate_btn = ctk.CTkButton(
-            btn_row, text="Generate", command=self._generate, height=38, width=140,
+            btn_row, text="Generate", command=self._generate, height=38,
         )
-        self._generate_btn.pack(side="right")
-        self._pdf_btn = ctk.CTkButton(
-            btn_row, text="Generate PDF", command=self._generate_pdf_only,
-            height=38, width=140, state="disabled",
-        )
-        self._pdf_btn.pack(side="right", padx=(0, 8))
+        self._generate_btn.pack(side="left", fill="x", expand=True)
+
+        btn_row2 = ctk.CTkFrame(f, fg_color="transparent")
+        btn_row2.grid(row=grow(), column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        ctk.CTkButton(
+            btn_row2, text="Re-detect", command=self._refresh_analysis,
+            fg_color="transparent", border_width=1, height=32,
+            text_color=("gray10", "gray90"),
+            border_color=("gray60", "gray40"),
+            hover_color=("gray85", "gray25"),
+        ).pack(side="left", fill="x", expand=True)
 
     def _build_preview(self) -> None:
         p = self._preview
@@ -391,6 +376,9 @@ class GeneratorScreen(ctk.CTkFrame):
             ctk.CTkButton(
                 self._picker_bar, text=label, command=cmd,
                 fg_color="transparent", border_width=1, height=28,
+                text_color=("gray10", "gray90"),
+                border_color=("gray60", "gray40"),
+                hover_color=("gray85", "gray25"),
             ).pack(side="top", anchor="w", pady=2)
 
         for field in excel_missing:
@@ -560,18 +548,6 @@ class GeneratorScreen(ctk.CTkFrame):
                 + ". Use the picker buttons, then re-generate."
             )
 
-        # Remember the target so the Generate-PDF button can operate on it.
-        self._last_target_folder = result.copied_folder
-        self._last_generated_files = [p for p in (result.excel_path, result.word_path) if p]
-        self._pdf_btn.configure(state="normal")
-
-        # Run PDF export inline if the toggle is on.
-        if self._pdf_toggle_var.get() and self._last_generated_files:
-            pdf_lines = self._run_pdf_export(self._last_generated_files, result.copied_folder)
-            if pdf_lines:
-                lines.append("")
-                lines.extend(pdf_lines)
-
         self._result_box.configure(text="\n".join(lines))
 
         if messagebox.askyesno(
@@ -580,46 +556,6 @@ class GeneratorScreen(ctk.CTkFrame):
             parent=self,
         ):
             open_in_os(result.copied_folder)
-
-    def _on_pdf_toggle(self) -> None:
-        self.app.cfg.generate_pdf_on_export = bool(self._pdf_toggle_var.get())  # type: ignore[attr-defined]
-        self.app.save_config()
-
-    def _generate_pdf_only(self) -> None:
-        if not self._last_target_folder or not self._last_generated_files:
-            messagebox.showinfo(
-                "Generate first",
-                "Click Generate to create the next month's folder first, "
-                "then use this button to export PDFs from it.",
-                parent=self,
-            )
-            return
-        lines = self._run_pdf_export(self._last_generated_files, self._last_target_folder)
-        if lines:
-            existing = self._result_box.cget("text") or ""
-            self._result_box.configure(text=existing + "\n\n" + "\n".join(lines))
-
-    def _run_pdf_export(self, files: list[Path], out_dir: Path) -> list[str]:
-        if not pdf_backend_available():
-            messagebox.showinfo(
-                "PDF export unavailable",
-                pdf_install_hint(),
-                parent=self,
-            )
-            return [f"PDF skipped — {pdf_install_hint()}"]
-        try:
-            r = export_to_pdf(files, out_dir)
-        except PdfExportError as e:
-            messagebox.showerror("PDF export failed", str(e), parent=self)
-            return [f"PDF export failed: {e}"]
-        if not r.generated:
-            return ["PDF export produced no files."]
-        backend_name = {"msoffice": "MS Office", "libreoffice": "LibreOffice"}.get(
-            r.backend, r.backend,
-        )
-        return [f"Exported PDFs (via {backend_name}):"] + [
-            f"  {p.name}" for p in r.generated
-        ]
 
 
 def _parse_float(raw: str, fallback):

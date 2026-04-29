@@ -27,10 +27,6 @@ hidden_imports = [
     "xlrd",  # legacy .xls reader
     "sqlalchemy.dialects.sqlite",
 ]
-if sys.platform == "win32":
-    # PDF export uses MS Word/Excel via COM; pywin32 is only installed on
-    # Windows and needs to be explicitly bundled by PyInstaller.
-    hidden_imports += ["win32com", "win32com.client", "pythoncom", "pywintypes"]
 
 excludes = ["matplotlib", "numpy", "scipy", "PyQt5", "PyQt6", "PySide2", "PySide6"]
 

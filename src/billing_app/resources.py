@@ -14,9 +14,8 @@ class AppConfig:
     color_theme: str = "blue"
     last_source_folder: str = ""
     default_output_root: str = ""
-    window_geometry: str = "1100x720"
+    window_geometry: str = "1200x760"
     date_format: str = "%B %d, %Y"
-    generate_pdf_on_export: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
