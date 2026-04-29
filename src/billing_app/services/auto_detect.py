@@ -47,6 +47,7 @@ class ExcelDetection:
     hours_per_day: float | None = None
     guards: int | None = None
     legacy_xls: bool = False  # True when the source was a .xls (BIFF) file
+    formula_dates: bool = False  # True when col B has =TEXT(DATE(...)) style formulas
     warnings: list[str] = field(default_factory=list)
 
     def missing_fields(self) -> list[str]:
@@ -165,58 +166,29 @@ class WordDetection:
 
 # ---------------------------------------------------------------- Excel ----
 
-def convert_xls_to_xlsx(xls_path: Path, xlsx_path: Path) -> None:
-    """Convert a legacy .xls (BIFF) workbook to a new .xlsx file using xlrd
-    to read and openpyxl to write. Values, types, and dates are preserved;
-    cell formatting is intentionally dropped — we only need the data.
-    """
-    import xlrd
-    from openpyxl import Workbook
-
-    wb_in = xlrd.open_workbook(str(xls_path), formatting_info=False)
-    wb_out = Workbook()
-    # Remove the default blank sheet openpyxl creates.
-    wb_out.remove(wb_out.active)
-    for sheet in wb_in.sheets():
-        ws = wb_out.create_sheet(title=sheet.name or "Sheet")
-        for r in range(sheet.nrows):
-            for c in range(sheet.ncols):
-                ctype = sheet.cell_type(r, c)
-                if ctype == xlrd.XL_CELL_EMPTY:
-                    continue
-                val: Any = sheet.cell_value(r, c)
-                if ctype == xlrd.XL_CELL_DATE:
-                    try:
-                        val = xlrd.xldate.xldate_as_datetime(val, wb_in.datemode)
-                    except (ValueError, xlrd.xldate.XLDateError):
-                        val = sheet.cell_value(r, c)
-                elif ctype == xlrd.XL_CELL_BOOLEAN:
-                    val = bool(val)
-                elif ctype == xlrd.XL_CELL_NUMBER:
-                    # xlrd returns every number as float; keep ints as ints
-                    # where that's lossless, so downstream heuristics that
-                    # check isinstance(val, int) still fire.
-                    if float(val).is_integer():
-                        val = int(val)
-                ws.cell(row=r + 1, column=c + 1, value=val)
-    wb_out.save(str(xlsx_path))
-
-
 def detect_excel(excel_path: Path) -> ExcelDetection:
-    """Detect field locations in an Excel workbook. Accepts .xlsx/.xlsm and
-    legacy .xls (auto-converts to a temp .xlsx first)."""
+    """Detect field locations in an Excel workbook.
+
+    Accepts both `.xlsx`/`.xlsm` and legacy `.xls`. For .xls input we run
+    a real-fidelity conversion (MS Excel COM on Windows, LibreOffice
+    elsewhere) into a temp .xlsx, then run normal detection on it.
+    """
     if excel_path.suffix.lower() == ".xls":
-        import tempfile
-        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".xlsx")
-        import os as _os
-        _os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
+        from .xls_to_xlsx import XlsConvertError, convert_xls_to_xlsx
+        # Place the temp .xlsx beside the source so sandboxed LibreOffice
+        # snaps (which can't write to /tmp) still succeed.
+        tmp_path = excel_path.parent / f".{excel_path.stem}.preview.xlsx"
         try:
             convert_xls_to_xlsx(excel_path, tmp_path)
             result = _detect_xlsx(tmp_path)
+        except XlsConvertError as e:
+            result = ExcelDetection(legacy_xls=True)
+            result.warnings.append(str(e))
+            return result
         finally:
             try:
-                tmp_path.unlink()
+                if tmp_path.exists():
+                    tmp_path.unlink()
             except OSError:
                 pass
         result.legacy_xls = True
@@ -309,16 +281,94 @@ def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
                     result.detected_month = run_month
                     result.detected_year = run_year
 
+        # If we didn't find a literal-date column, try formula-based dates.
+        # Templates like the Bella Vista breakdown drive the date column from
+        # =TEXT(DATE(year, $K$2, A_), ...) formulas, so the cell values are
+        # text strings (Wednesday, April-1 ,2026) but the column STILL acts
+        # as the dates column once we know it. Detect by scanning column B
+        # for that formula pattern in the workbook loaded WITHOUT data_only.
+        if result.dates_column_start is None:
+            formula_wb = load_workbook(filename=str(xlsx_path), data_only=False)
+            try:
+                ws_raw = formula_wb[ws.title] if ws.title in formula_wb.sheetnames else formula_wb.active
+                first_formula_row: int | None = None
+                last_formula_row: int | None = None
+                for col in range(1, 12):
+                    first_formula_row = None
+                    last_formula_row = None
+                    for row in range(1, 60):
+                        v = ws_raw.cell(row=row, column=col).value
+                        if isinstance(v, str) and v.startswith("=") and "DATE(" in v.upper():
+                            if first_formula_row is None:
+                                first_formula_row = row
+                            last_formula_row = row
+                    if first_formula_row is not None and last_formula_row - first_formula_row >= 5:
+                        col_letter = get_column_letter(col)
+                        result.dates_column_start = f"{col_letter}{first_formula_row}"
+                        result.dates_row_end = last_formula_row
+                        result.formula_dates = True
+                        # Try to read the year out of the formula text so the
+                        # update step knows whether to swap years.
+                        sample = ws_raw.cell(
+                            row=first_formula_row, column=col,
+                        ).value or ""
+                        ym = re.search(r"DATE\(\s*\"?(\d{4})", sample)
+                        if ym:
+                            result.detected_year = int(ym.group(1))
+                        break
+            finally:
+                formula_wb.close()
+
         # Read rate, hours per day, guards from the first date row.
         if result.dates_column_start:
             start_cell = result.dates_column_start
             col_letter = re.match(r"([A-Z]+)", start_cell).group(1)
             col_idx = _col_to_index(col_letter)
             start_row = int(start_cell[len(col_letter):])
-            # Scan a handful of neighbouring columns on the start row and pick
-            # the first small integer (hours) and first currency-ish value (rate).
+
+            # Reload without data_only so we can tell formula cells apart
+            # from literal ones. Formula cells are derived (e.g. regular
+            # hours = hours * guards), so they're poor signals for rate
+            # or hours-per-day detection.
+            try:
+                wb_raw = load_workbook(filename=str(xlsx_path), data_only=False)
+                ws_raw = wb_raw[ws.title] if ws.title in wb_raw.sheetnames else wb_raw.active
+            except Exception:  # noqa: BLE001
+                ws_raw = None
+
+            # Header-based mapping: prefer columns whose row-above header
+            # explicitly names the field (works regardless of column order).
+            label_map = {
+                "hours_per_day": _re_header(r"hours?\s*per\s*day"),
+                "guards": _re_header(r"(?:number\s*of\s*)?guards?"),
+                "hourly_rate": _re_header(r"hourly\s*rate|rate"),
+            }
+            header_row = start_row - 1
+            for col in range(col_idx + 1, col_idx + 11):
+                header = ws.cell(row=header_row, column=col).value
+                if not isinstance(header, str):
+                    continue
+                txt = header.strip().lower()
+                for field_name, pat in label_map.items():
+                    if pat.search(txt):
+                        val = ws.cell(row=start_row, column=col).value
+                        if isinstance(val, (int, float)) and val > 0:
+                            cur = getattr(result, field_name)
+                            if cur is None:
+                                setattr(
+                                    result, field_name,
+                                    int(val) if field_name == "guards" else float(val),
+                                )
+                        break
+
+            # Fallback positional sweep — but skip cells whose underlying
+            # value is a formula (they're derived, not source data).
             for col in range(col_idx + 1, col_idx + 8):
                 val = ws.cell(row=start_row, column=col).value
+                raw = ws_raw.cell(row=start_row, column=col).value if ws_raw else None
+                is_formula = isinstance(raw, str) and raw.startswith("=")
+                if is_formula:
+                    continue
                 if isinstance(val, (int, float)) and val > 0:
                     if result.hours_per_day is None and 1 <= val <= 24 and isinstance(val, int):
                         result.hours_per_day = float(val)
@@ -326,6 +376,9 @@ def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
                         result.guards = int(val)
                     elif result.hourly_rate is None and val >= 5:
                         result.hourly_rate = float(val)
+            if ws_raw is not None:
+                wb_raw.close()
+
             if result.hours_per_day is None:
                 result.hours_per_day = 0.0
             if result.guards is None:
@@ -336,6 +389,10 @@ def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
         return result
     finally:
         wb.close()
+
+
+def _re_header(pattern: str) -> "re.Pattern[str]":
+    return re.compile(rf"\b{pattern}\b", re.IGNORECASE)
 
 
 def _as_date(val: Any) -> date | None:

@@ -304,7 +304,7 @@ class GeneratorScreen(ctk.CTkFrame):
             if analysis.excel_is_legacy_xls:
                 parts.append(
                     f"Excel: {analysis.excel_path.name}  (legacy .xls — "
-                    f"will be converted to .xlsx in the new folder)"
+                    "will be auto-converted to .xlsx in the new folder)"
                 )
             else:
                 parts.append(f"Excel: {analysis.excel_path.name}")

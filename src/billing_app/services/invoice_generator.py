@@ -32,7 +32,6 @@ from .auto_detect import (
     ExcelDetection,
     WordDetection,
     WordLoc,
-    convert_xls_to_xlsx,
     detect_excel,
     detect_word,
     load_cache,
@@ -40,6 +39,7 @@ from .auto_detect import (
 )
 from .calendar_util import MONTH_NAMES, days_in_month, month_name
 from .folder_analyzer import FolderAnalysis, analyze, rename_for_target
+from .xls_to_xlsx import XlsConvertError, convert_xls_to_xlsx
 
 
 @dataclass
@@ -159,9 +159,7 @@ def generate(req: GenerateRequest) -> GenerateResult:
 
     shutil.copytree(source, target_folder)
 
-    # Drop any stale PDF exports copied over from the source folder — PDFs
-    # are now generated on demand, so keeping the previous month's versions
-    # would be misleading.
+    # Drop any stale PDF exports copied over from the source folder.
     for item in target_folder.iterdir():
         if item.is_file() and item.suffix.lower() == ".pdf":
             try:
@@ -176,22 +174,31 @@ def generate(req: GenerateRequest) -> GenerateResult:
         else analysis.next_invoice_number
     )
 
-    # If the source folder carries a legacy .xls, upgrade it to .xlsx inside
-    # the target folder before we do anything else. The original .xls in the
-    # source stays untouched; the target-folder .xls is replaced by an
-    # equivalent .xlsx that the rest of the pipeline can edit.
+    # Upgrade legacy .xls -> .xlsx INSIDE the target folder using a
+    # real-fidelity backend (MS Excel COM on Windows, LibreOffice elsewhere).
+    # The original .xls in the source stays untouched; the target's .xls is
+    # replaced by an equivalent .xlsx with all formatting/formulas intact.
     if analysis.excel_is_legacy_xls and analysis.excel_path is not None:
         legacy_in_target = target_folder / analysis.excel_path.name
         if legacy_in_target.exists():
             new_path_in_target = legacy_in_target.with_suffix(".xlsx")
-            convert_xls_to_xlsx(legacy_in_target, new_path_in_target)
+            try:
+                convert_xls_to_xlsx(legacy_in_target, new_path_in_target)
+            except XlsConvertError as e:
+                # Roll back the partially-built target folder so the user's
+                # tree is left clean, then surface a clear error.
+                try:
+                    shutil.rmtree(target_folder)
+                except OSError:
+                    pass
+                raise GeneratorError(
+                    f"Could not convert legacy .xls to .xlsx automatically: "
+                    f"{e}"
+                ) from e
             try:
                 legacy_in_target.unlink()
             except OSError:
                 pass
-            # Point the analysis at the new .xlsx in the target folder; every
-            # subsequent step (rename_for_target, detect_excel, _update_excel)
-            # operates on this file.
             analysis.excel_path = new_path_in_target
 
     new_excel, new_word = rename_for_target(
@@ -336,19 +343,36 @@ def _update_excel(
             col_letter, start_row = coordinate_from_string(det.dates_column_start)
             col_idx = _col_to_index(col_letter)
             target_days = days_in_month(target_year, target_month)
-            # Write new month dates.
-            for i in range(target_days):
-                d = date(target_year, target_month, i + 1)
-                cell = ws.cell(row=start_row + i, column=col_idx, value=d)
-                cell.number_format = "dddd, mmmm d, yyyy"
-            # Clear any trailing rows from the source month if it was longer.
-            source_days_guess = det.dates_row_end and (det.dates_row_end - start_row + 1)
-            source_days = source_days_guess or (
-                days_in_month(target_year, source_month) if source_month else 31
-            )
-            if source_days > target_days:
-                for i in range(target_days, source_days):
-                    ws.cell(row=start_row + i, column=col_idx).value = None
+            if det.formula_dates:
+                # Template uses =TEXT(DATE(YYYY, $K$_, A_)) formulas — the
+                # date column auto-regenerates from the month cell we just
+                # wrote above. We only need to (a) extend or trim data rows
+                # so totals cover exactly target_days, and (b) swap the
+                # hardcoded year if the user moved into a new year.
+                _adjust_formula_rows(
+                    ws,
+                    start_row=start_row,
+                    last_row=det.dates_row_end or (start_row + target_days - 1),
+                    target_days=target_days,
+                )
+                if det.detected_year and det.detected_year != target_year:
+                    _swap_year_in_formulas(
+                        ws, det.detected_year, target_year,
+                    )
+            else:
+                # Write new-month dates literally.
+                for i in range(target_days):
+                    d = date(target_year, target_month, i + 1)
+                    cell = ws.cell(row=start_row + i, column=col_idx, value=d)
+                    cell.number_format = "dddd, mmmm d, yyyy"
+                # Clear trailing rows when source month was longer.
+                source_days_guess = det.dates_row_end and (det.dates_row_end - start_row + 1)
+                source_days = source_days_guess or (
+                    days_in_month(target_year, source_month) if source_month else 31
+                )
+                if source_days > target_days:
+                    for i in range(target_days, source_days):
+                        ws.cell(row=start_row + i, column=col_idx).value = None
         else:
             unresolved.append("dates_column_start")
 
@@ -398,6 +422,81 @@ def _update_word(
 
     doc.save(str(path))
     return unresolved
+
+
+def _adjust_formula_rows(ws, *, start_row: int, last_row: int, target_days: int) -> None:
+    """Make sure exactly `target_days` data rows exist below the header.
+
+    For shorter months, extra rows beyond target_days are blanked out so
+    SUM() ranges that span the maximum month length still produce correct
+    totals. For longer months we replicate the last existing data row,
+    rewriting any formula references from the template-row index to the
+    new row index.
+    """
+    import re as _re
+    current_rows = last_row - start_row + 1
+    needed_rows = target_days
+
+    # Trim: blank out rows beyond target_days (within the existing range).
+    if needed_rows < current_rows:
+        for i in range(needed_rows, current_rows):
+            row = start_row + i
+            for col in range(1, ws.max_column + 1):
+                ws.cell(row=row, column=col).value = None
+        return
+
+    # Extend: copy the template (last) row down to fill missing rows.
+    if needed_rows > current_rows:
+        ref_row = last_row
+        max_col = ws.max_column
+        for i in range(current_rows, needed_rows):
+            new_row = start_row + i
+            day_number = i + 1
+            for col in range(1, max_col + 1):
+                src = ws.cell(row=ref_row, column=col)
+                dst = ws.cell(row=new_row, column=col)
+                v = src.value
+                if isinstance(v, str) and v.startswith("="):
+                    # Bump every relative reference that points at ref_row
+                    # forward to new_row (e.g. C36 -> C37).
+                    new_v = _re.sub(
+                        rf"(\$?[A-Z]+\$?){ref_row}\b",
+                        rf"\g<1>{new_row}",
+                        v,
+                    )
+                    dst.value = new_v
+                else:
+                    dst.value = v
+                _copy_cell_style(src, dst)
+            # Day-number column (col A): force a literal value so subsequent
+            # rows referencing A_ via formula still chain correctly even if
+            # the source row's A cell happened to be a literal.
+            ws.cell(row=new_row, column=1).value = day_number
+
+
+def _copy_cell_style(src, dst) -> None:
+    from copy import copy as _copy
+    if src.has_style:
+        dst.font = _copy(src.font)
+        dst.border = _copy(src.border)
+        dst.fill = _copy(src.fill)
+        dst.number_format = src.number_format
+        dst.alignment = _copy(src.alignment)
+        dst.protection = _copy(src.protection)
+
+
+def _swap_year_in_formulas(ws, old_year: int, new_year: int) -> None:
+    """Replace `old_year` with `new_year` everywhere it appears as a literal
+    inside a formula string. Used when the user moves into a new calendar
+    year (e.g. April 2026 -> January 2027).
+    """
+    import re as _re
+    pattern = _re.compile(rf"(?<![0-9]){old_year}(?![0-9])")
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if isinstance(v, str) and v.startswith("=") and pattern.search(v):
+                cell.value = pattern.sub(str(new_year), v)
 
 
 def _set_cell_text_legacy(cell, text: str, paragraph_index: int = 0) -> None:

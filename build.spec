@@ -24,9 +24,13 @@ hidden_imports = [
     "customtkinter",
     "openpyxl",
     "docx",
-    "xlrd",  # legacy .xls reader
     "sqlalchemy.dialects.sqlite",
 ]
+if sys.platform == "win32":
+    # MS Excel COM (used to convert legacy .xls -> .xlsx with full fidelity)
+    # is reached through pywin32, which is only installed on Windows and
+    # needs explicit hidden imports for PyInstaller.
+    hidden_imports += ["win32com", "win32com.client", "pythoncom", "pywintypes"]
 
 excludes = ["matplotlib", "numpy", "scipy", "PyQt5", "PyQt6", "PySide2", "PySide6"]
 

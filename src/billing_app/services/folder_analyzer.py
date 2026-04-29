@@ -62,8 +62,8 @@ def analyze(folder: Path) -> FolderAnalysis:
 
     # Only look at top-level files. Subfolders (Attachments/, Documents/) ride
     # along during copy but never get edited. PDFs are silently ignored —
-    # they're typically stale exports, and PDF generation is now an explicit
-    # user-triggered action.
+    # they're typically stale exports. .xls is accepted; the generator runs
+    # a real-fidelity conversion (MS Excel COM / LibreOffice) when needed.
     legacy_candidate: Path | None = None
     for item in folder.iterdir():
         if not item.is_file():
@@ -79,7 +79,7 @@ def analyze(folder: Path) -> FolderAnalysis:
                     f"multiple Excel files found; using {result.excel_path.name}"
                 )
         elif lower.endswith(".xls"):
-            # Defer: prefer a proper .xlsx if one exists in the same folder.
+            # Defer: prefer a sibling .xlsx if one exists in the same folder.
             if legacy_candidate is None:
                 legacy_candidate = item
             else:
@@ -93,13 +93,11 @@ def analyze(folder: Path) -> FolderAnalysis:
                     f"multiple Word files found; using {result.word_path.name}"
                 )
         elif lower.endswith(".pdf"):
-            # Ignore PDF exports entirely. Not recorded in extra_files so they
-            # don't appear in unresolved-item warnings.
-            continue
+            continue  # ignore exports
         else:
             result.extra_files.append(item)
 
-    # Promote the .xls candidate only if no .xlsx was found.
+    # Promote the legacy .xls only if no .xlsx was found.
     if result.excel_path is None and legacy_candidate is not None:
         result.excel_path = legacy_candidate
         result.excel_is_legacy_xls = True
