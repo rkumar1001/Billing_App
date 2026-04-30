@@ -36,6 +36,11 @@ class FolderAnalysis:
     invoice_number: int | None = None
     folder_month_token: str = ""  # e.g. "March" — token we'll swap in filenames
     excel_is_legacy_xls: bool = False
+    # Auxiliary spreadsheets in the same folder that should be carried
+    # along and bumped each month, keyed by detected role:
+    # "payment_request_form", "g703", etc. Each entry is the source path
+    # plus a flag for whether it's a legacy .xls.
+    auxiliary_excels: list[tuple[Path, str, bool]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -60,30 +65,18 @@ def analyze(folder: Path) -> FolderAnalysis:
         result.warnings.append(f"{folder} is not a folder")
         return result
 
-    # Only look at top-level files. Subfolders (Attachments/, Documents/) ride
-    # along during copy but never get edited. PDFs are silently ignored —
-    # they're typically stale exports. .xls is accepted; the generator runs
-    # a real-fidelity conversion (MS Excel COM / LibreOffice) when needed.
-    legacy_candidate: Path | None = None
+    # Collect every spreadsheet first; we'll classify by content afterwards
+    # so we always pick the daily-breakdown file as the primary, even when
+    # auxiliary forms (G703, payment-request-form) sit in the same folder.
+    spreadsheets: list[tuple[Path, bool]] = []  # (path, is_legacy_xls)
     for item in folder.iterdir():
         if not item.is_file():
             continue
         lower = item.name.lower()
         if lower.endswith(".xlsx") or lower.endswith(".xlsm"):
-            if result.excel_path is None:
-                result.excel_path = item
-                result.excel_is_legacy_xls = False
-            else:
-                result.extra_files.append(item)
-                result.warnings.append(
-                    f"multiple Excel files found; using {result.excel_path.name}"
-                )
+            spreadsheets.append((item, False))
         elif lower.endswith(".xls"):
-            # Defer: prefer a sibling .xlsx if one exists in the same folder.
-            if legacy_candidate is None:
-                legacy_candidate = item
-            else:
-                result.extra_files.append(item)
+            spreadsheets.append((item, True))
         elif lower.endswith(".docx"):
             if result.word_path is None:
                 result.word_path = item
@@ -97,26 +90,83 @@ def analyze(folder: Path) -> FolderAnalysis:
         else:
             result.extra_files.append(item)
 
-    # Promote the legacy .xls only if no .xlsx was found.
-    if result.excel_path is None and legacy_candidate is not None:
-        result.excel_path = legacy_candidate
-        result.excel_is_legacy_xls = True
+    # Classify spreadsheets. Legacy .xls files require a real-fidelity
+    # conversion before we can read them — to keep `analyze` cheap we read
+    # the .xlsx ones directly and treat any single .xls as a likely
+    # breakdown unless an .xlsx breakdown is already present.
+    from .file_role import classify_workbook
+    breakdown: tuple[Path, bool] | None = None
+    breakdown_role_known = False
+    auxiliaries: list[tuple[Path, str, bool]] = []
 
-    # Detect invoice number / prefix from the Word filename.
+    classified: list[tuple[Path, bool, str]] = []
+    for path, is_legacy in spreadsheets:
+        if is_legacy:
+            # Defer classification — converting just to peek at content is
+            # expensive. We still try below if we end up needing it.
+            classified.append((path, True, "unknown"))
+            continue
+        role = classify_workbook(path)
+        classified.append((path, False, role))
+
+    # First pick: a confidently-classified breakdown (.xlsx).
+    for path, is_legacy, role in classified:
+        if role == "breakdown" and breakdown is None:
+            breakdown = (path, is_legacy)
+            breakdown_role_known = True
+
+    # Fallback: if no .xlsx breakdown, promote a single legacy .xls (it's
+    # almost always the breakdown — auxiliary forms are .xlsx in practice).
+    if breakdown is None:
+        legacy_candidates = [c for c in classified if c[1]]
+        if len(legacy_candidates) == 1:
+            path, is_legacy, _ = legacy_candidates[0]
+            breakdown = (path, is_legacy)
+        elif legacy_candidates:
+            # Multiple .xls — pick the one whose name mentions "breakdown".
+            for path, is_legacy, _ in legacy_candidates:
+                if "breakdown" in path.name.lower():
+                    breakdown = (path, is_legacy)
+                    break
+            if breakdown is None:
+                breakdown = (legacy_candidates[0][0], True)
+
+    if breakdown is not None:
+        result.excel_path = breakdown[0]
+        result.excel_is_legacy_xls = breakdown[1]
+
+    # Everything else that classified as a known auxiliary role gets
+    # carried along.
+    for path, is_legacy, role in classified:
+        if breakdown is not None and path == breakdown[0]:
+            continue
+        if role in ("payment_request_form", "g703"):
+            auxiliaries.append((path, role, is_legacy))
+        else:
+            result.extra_files.append(path)
+    result.auxiliary_excels = auxiliaries
+
+    # Detect invoice number / prefix from the Word filename first, then
+    # fall back to the doc body (templates like Hartford's name files
+    # "Invoice HART April.docx" with no number in the filename).
     if result.word_path is not None:
         stem = result.word_path.stem  # strip .docx
-        # Drop a leading "Invoice " if present so the regex latches onto the
-        # client-specific prefix+number.
         stripped = re.sub(r"^(?:invoice[\s_-]*)", "", stem, flags=re.IGNORECASE)
         m = _INVOICE_NUM_RE.search(stripped)
         if m:
-            prefix_raw = m.group("prefix").strip(" _-")
-            result.invoice_prefix = prefix_raw
+            result.invoice_prefix = m.group("prefix").strip(" _-")
             result.invoice_number = int(m.group("number"))
         else:
-            result.warnings.append(
-                f"could not parse invoice number from '{result.word_path.name}'"
-            )
+            body_match = _read_invoice_number_from_docx(result.word_path)
+            if body_match is not None:
+                prefix, number = body_match
+                result.invoice_prefix = prefix
+                result.invoice_number = number
+            else:
+                result.warnings.append(
+                    f"could not parse invoice number from "
+                    f"'{result.word_path.name}' or its contents"
+                )
 
     # Detect source month from folder name, then (as a fallback) from xlsx name.
     month_token, month_num = _find_month_token(folder.name)
@@ -135,6 +185,49 @@ def analyze(folder: Path) -> FolderAnalysis:
             break
 
     return result
+
+
+def _read_invoice_number_from_docx(path: Path) -> tuple[str, int] | None:
+    """Best-effort scan of a .docx for an invoice number near a label.
+
+    Looks for a paragraph whose text matches ``Invoice #`` / ``Invoice
+    Number`` / ``Invoice``, then takes the next non-empty paragraph as
+    the value (e.g. ``HART 23``). Returns ``(prefix, number)`` on success.
+    """
+    try:
+        from docx import Document
+        from docx.oxml.ns import qn
+    except ImportError:
+        return None
+    try:
+        doc = Document(str(path))
+    except Exception:  # noqa: BLE001
+        return None
+
+    p_tag = qn("w:p")
+    t_tag = qn("w:t")
+    paragraphs: list[str] = []
+    for p in doc.element.body.iter(p_tag):
+        # Only leaf paragraphs (no nested w:p) — same rule as auto_detect.
+        if any(c is not p for c in p.iter(p_tag)):
+            continue
+        text = "".join((t.text or "") for t in p.iter(t_tag)).strip()
+        if text:
+            paragraphs.append(text)
+
+    label_re = re.compile(r"^\s*invoice(?:\s*#|\s*number|\s*no\.?)?\s*$", re.IGNORECASE)
+    for i, text in enumerate(paragraphs):
+        if label_re.match(text):
+            for j in range(i + 1, min(i + 5, len(paragraphs))):
+                cand = paragraphs[j]
+                # Skip "Date" / "Invoice Date" labels that often follow.
+                if re.match(r"^\s*(?:invoice\s*)?date\s*$", cand, re.IGNORECASE):
+                    continue
+                m = _INVOICE_NUM_RE.search(cand)
+                if m:
+                    return m.group("prefix").strip(" _-"), int(m.group("number"))
+                break
+    return None
 
 
 def _find_month_token(text: str) -> tuple[str, int | None]:
@@ -187,20 +280,62 @@ def rename_for_target(
         src_copy = copied_folder / analysis.word_path.name
         if src_copy.exists():
             old_stem = analysis.word_path.stem
+            new_stem = old_stem
             if analysis.invoice_number is not None:
                 old_suffix = f"{analysis.invoice_prefix}{analysis.invoice_number}"
                 new_suffix = f"{analysis.invoice_prefix}{new_invoice_number}"
-                new_stem = old_stem.replace(old_suffix, new_suffix)
-                if new_stem == old_stem:
-                    new_stem = re.sub(
+                replaced = old_stem.replace(old_suffix, new_suffix)
+                if replaced == old_stem:
+                    replaced = re.sub(
                         rf"{re.escape(analysis.invoice_prefix)}\s*\d+",
                         new_suffix,
                         old_stem,
                     )
-                new_word = src_copy.with_name(new_stem + src_copy.suffix)
-            else:
-                new_word = src_copy
+                new_stem = replaced
+            # Always also swap any month token (e.g. "April") in the
+            # filename — this is the only rename signal for templates that
+            # don't put the invoice number in the filename.
+            new_stem = swap_any_month_token(new_stem, target_month)
+            new_word = src_copy.with_name(new_stem + src_copy.suffix)
             if new_word != src_copy:
                 src_copy.rename(new_word)
+            else:
+                new_word = src_copy
 
     return new_excel, new_word
+
+
+def swap_any_month_token(text: str, target_month: int) -> str:
+    """Replace any month name (full or 3-letter abbrev) found in `text`
+    with the target month's full name. Used to rename files whose
+    filenames carry a stale month (e.g. ``FCC Application for Payment
+    February.xlsx`` -> ``FCC Application for Payment May.xlsx``).
+
+    Handles underscore-bounded abbreviations too (``SOV_FEB_..`` ->
+    ``SOV_May_..``) since underscores aren't word boundaries to ``\\b``.
+    """
+    target_full = MONTH_NAMES[target_month - 1]
+
+    def _try(name: str) -> str | None:
+        # Match `name` only when bounded by something that ISN'T an
+        # alphanumeric (so "May" matches in "Payment May.xlsx" and
+        # "FEB" matches in "SOV_FEB_..."). Use a negative-look-behind /
+        # negative-look-ahead so we don't consume the surrounding chars.
+        m = re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            return text[: m.start()] + target_full + text[m.end():]
+        return None
+
+    for full in MONTH_NAMES:
+        out = _try(full)
+        if out is not None:
+            return out
+    for full in MONTH_NAMES:
+        out = _try(full[:3])
+        if out is not None:
+            return out
+    return text

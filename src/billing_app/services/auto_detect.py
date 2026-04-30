@@ -33,6 +33,8 @@ from docx.oxml.ns import qn
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
+from .calendar_util import MONTH_NAMES
+
 
 @dataclass
 class ExcelDetection:
@@ -48,6 +50,8 @@ class ExcelDetection:
     guards: int | None = None
     legacy_xls: bool = False  # True when the source was a .xls (BIFF) file
     formula_dates: bool = False  # True when col B has =TEXT(DATE(...)) style formulas
+    text_dates: bool = False     # True when dates are stored as plain text strings
+    text_date_format: str = ""   # strftime template derived from the source text
     warnings: list[str] = field(default_factory=list)
 
     def missing_fields(self) -> list[str]:
@@ -134,31 +138,45 @@ class WordLoc:
 class WordDetection:
     invoice_number: WordLoc | None = None
     invoice_date: WordLoc | None = None
-    billing_period: WordLoc | None = None
+    billing_period: WordLoc | None = None  # Bella-style: single "X – Y" range
+    from_date: WordLoc | None = None       # Hartford-style: separate "From Date" cell
+    to_date: WordLoc | None = None         # Hartford-style: separate "To Date" cell
     total_hours: WordLoc | None = None
     grand_total: WordLoc | None = None
     warnings: list[str] = field(default_factory=list)
 
+    _FIELDS = (
+        "invoice_number", "invoice_date", "billing_period",
+        "from_date", "to_date", "total_hours", "grand_total",
+    )
+
     def missing_fields(self) -> list[str]:
-        out = []
-        for name in ("invoice_number", "invoice_date", "billing_period",
-                     "total_hours", "grand_total"):
+        out: list[str] = []
+        # An invoice has EITHER a billing_period (single range) OR a
+        # from/to pair — only flag whichever style is missing entirely.
+        for name in ("invoice_number", "invoice_date"):
             if getattr(self, name) is None:
                 out.append(name)
+        if self.billing_period is None and (self.from_date is None or self.to_date is None):
+            out.append("billing_period (or from/to dates)")
+        # total_hours / grand_total only matter when billing_period style
+        # is in use; multi-row Hartford-style invoices keep these untouched.
+        if self.billing_period is not None:
+            for name in ("total_hours", "grand_total"):
+                if getattr(self, name) is None:
+                    out.append(name)
         return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
             name: (getattr(self, name).to_dict() if getattr(self, name) else None)
-            for name in ("invoice_number", "invoice_date", "billing_period",
-                         "total_hours", "grand_total")
+            for name in self._FIELDS
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WordDetection":
         kwargs: dict[str, WordLoc | None] = {}
-        for name in ("invoice_number", "invoice_date", "billing_period",
-                     "total_hours", "grand_total"):
+        for name in cls._FIELDS:
             v = data.get(name)
             kwargs[name] = WordLoc.from_dict(v) if v else None
         return cls(**kwargs)
@@ -197,9 +215,11 @@ def detect_excel(excel_path: Path) -> ExcelDetection:
 
 
 def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
+    from .file_role import pick_data_sheet
     wb = load_workbook(filename=str(xlsx_path), data_only=True)
     try:
-        ws = wb.active
+        sheet_name = pick_data_sheet(wb)
+        ws = wb[sheet_name]
         result = ExcelDetection(sheet=ws.title)
 
         # Month number: integer 1..12 in top 5 rows, rightmost wins.
@@ -281,7 +301,72 @@ def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
                     result.detected_month = run_month
                     result.detected_year = run_year
 
-        # If we didn't find a literal-date column, try formula-based dates.
+        # If we didn't find a literal-date column, try a text-date column.
+        # Templates like the Hartford breakdown store the daily date as a
+        # plain text string (e.g. " Wednesday, April-1 ,2026") rather than a
+        # date-typed cell or a formula. The text follows a recognisable
+        # pattern: <Weekday>, <Month>-<Day> ,<Year>.
+        if result.dates_column_start is None:
+            text_date_re = re.compile(
+                r"\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*\s*,\s*"
+                r"(?:January|February|March|April|May|June|July|August|"
+                r"September|October|November|December|Jan|Feb|Mar|Apr|"
+                r"Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*[-/ ]\s*"
+                r"(?P<day>\d{1,2})\s*[, ]*\s*(?P<year>\d{4})",
+                re.IGNORECASE,
+            )
+            for col in range(1, 12):
+                run_start: int | None = None
+                run_len = 0
+                run_year = None
+                run_month: int | None = None
+                for row in range(1, 60):
+                    v = ws.cell(row=row, column=col).value
+                    if not isinstance(v, str):
+                        if run_len >= 20:
+                            break
+                        run_start = None
+                        run_len = 0
+                        continue
+                    m = text_date_re.match(v)
+                    if not m:
+                        if run_len >= 20:
+                            break
+                        run_start = None
+                        run_len = 0
+                        continue
+                    day = int(m.group("day"))
+                    if run_start is None:
+                        if day != 1:
+                            continue
+                        run_start = row
+                        run_len = 1
+                        run_year = int(m.group("year"))
+                    else:
+                        if day == run_len + 1:
+                            run_len += 1
+                        else:
+                            break
+                if run_len >= 20:
+                    col_letter = get_column_letter(col)
+                    result.dates_column_start = f"{col_letter}{run_start}"
+                    result.dates_row_end = run_start + run_len - 1
+                    if result.detected_year is None:
+                        result.detected_year = run_year
+                    result.text_dates = True
+                    sample = ws.cell(row=run_start, column=col).value or ""
+                    fmt = _derive_text_date_format(sample)
+                    if fmt:
+                        result.text_date_format = fmt
+                    # Try to derive the source month from the sample text.
+                    if result.detected_month is None:
+                        for idx, name in enumerate(MONTH_NAMES, start=1):
+                            if re.search(rf"\b{name}\b", sample, re.IGNORECASE):
+                                result.detected_month = idx
+                                break
+                    break
+
+        # If we still didn't find a dates column, try formula-based dates.
         # Templates like the Bella Vista breakdown drive the date column from
         # =TEXT(DATE(year, $K$2, A_), ...) formulas, so the cell values are
         # text strings (Wednesday, April-1 ,2026) but the column STILL acts
@@ -395,6 +480,54 @@ def _re_header(pattern: str) -> "re.Pattern[str]":
     return re.compile(rf"\b{pattern}\b", re.IGNORECASE)
 
 
+def _derive_text_date_format(sample: str) -> str | None:
+    """Convert a sample date string like ' Wednesday, April-1 ,2026' into a
+    strftime template that reproduces it for any other date.
+
+    Returns None if the sample's structure can't be recognised.
+    """
+    import platform
+    day_directive = "%#d" if platform.system() == "Windows" else "%-d"
+    weekday_re = re.compile(
+        r"(?P<wd>Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|"
+        r"Mon|Tue|Wed|Thu|Fri|Sat|Sun)",
+        re.IGNORECASE,
+    )
+    month_re = re.compile(
+        r"(?P<mo>January|February|March|April|May|June|July|August|September|"
+        r"October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|"
+        r"Nov|Dec)",
+        re.IGNORECASE,
+    )
+    wd_m = weekday_re.search(sample)
+    mo_m = month_re.search(sample, pos=wd_m.end() if wd_m else 0)
+    if not wd_m or not mo_m:
+        return None
+    # Day: 1-2 digits AFTER the month.
+    day_m = re.search(r"\b(\d{1,2})\b", sample[mo_m.end():])
+    # Year: 4-digit number AFTER the day.
+    year_m = None
+    if day_m:
+        year_m = re.search(r"\b(\d{4})\b", sample[mo_m.end() + day_m.end():])
+    if not day_m or not year_m:
+        return None
+
+    # Long vs abbreviated forms.
+    wd_dir = "%A" if len(wd_m.group("wd")) > 3 else "%a"
+    mo_dir = "%B" if len(mo_m.group("mo")) > 3 else "%b"
+
+    # Stitch the original literal text back together with directives.
+    out = sample[: wd_m.start()] + wd_dir
+    out += sample[wd_m.end(): mo_m.start()] + mo_dir
+    out += sample[mo_m.end(): mo_m.end() + day_m.start()] + day_directive
+    abs_day_end = mo_m.end() + day_m.end()
+    abs_year_start = mo_m.end() + day_m.end() + year_m.start()
+    abs_year_end = mo_m.end() + day_m.end() + year_m.end()
+    out += sample[abs_day_end: abs_year_start] + "%Y"
+    out += sample[abs_year_end:]
+    return out
+
+
 def _as_date(val: Any) -> date | None:
     if isinstance(val, datetime):
         return val.date()
@@ -503,26 +636,79 @@ def detect_word(docx_path: Path, invoice_number_str: str) -> WordDetection:
 
     # --- invoice_number (exact-ish match against the parsed filename number)
     if invoice_number_str:
-        # Try joined match first — some templates split "Bella17" across runs.
+        # Build a tolerant pattern: e.g. "HART23" -> "HART\s*23" so the doc's
+        # "HART 23" matches, AND we record the EXACT substring found so the
+        # editor replaces it precisely (preserving the space if present).
+        m_split = re.match(r"^([A-Za-z]+)\s*(\d+)$", invoice_number_str)
         joined_target = invoice_number_str.replace(" ", "")
         for order, text in paragraphs:
             compact = text.replace(" ", "")
-            if joined_target in compact:
-                # Record the literal substring as it appears in the real text.
-                m = re.search(
-                    re.escape(invoice_number_str).replace(r"\ ", r"\s*"),
+            if joined_target not in compact:
+                continue
+            real = None
+            if m_split:
+                real = re.search(
+                    rf"{re.escape(m_split.group(1))}\s*{m_split.group(2)}",
                     text,
                 )
-                match = m.group(0) if m else invoice_number_str
-                _set_loc("invoice_number", order, text, match)
-                break
+            if real is None:
+                real = re.search(re.escape(invoice_number_str), text)
+            match = real.group(0) if real else invoice_number_str
+            _set_loc("invoice_number", order, text, match)
+            break
 
-    # --- billing_period (date range)
+    # --- billing_period (date range, Bella-style)
     for order, text in paragraphs:
         m = _DATE_RANGE_RE.search(text)
         if m:
             _set_loc("billing_period", order, text, m.group(0))
             break
+
+    # --- from_date / to_date (Hartford-style: two separate cells in a
+    # multi-row line-items table). Only attempt this when no single-paragraph
+    # billing_period was found, since the two styles are mutually exclusive.
+    if result.billing_period is None:
+        # Heuristic: walk paragraphs, tracking when we've passed a "From" /
+        # "From Date" header. The first standalone-date paragraph after that
+        # is from_date; the next one is to_date. A "standalone date" paragraph
+        # is one whose joined text is JUST a single date (no range, no label).
+        seen_from_label = False
+        seen_to_label = False
+        from_label_re = re.compile(r"\bfrom(?:\s+date)?\b", re.IGNORECASE)
+        to_label_re = re.compile(r"\bto(?:\s+date)?\b", re.IGNORECASE)
+        # We need to handle the case where "From" and "Date" are split into
+        # two consecutive paragraphs (template shows "From / Date" stacked).
+        prev_text = ""
+        for order, text in paragraphs:
+            stripped = text.strip()
+            # Mark labels.
+            combined_prev = (prev_text + " " + stripped).strip()
+            if not seen_from_label and (
+                from_label_re.search(stripped)
+                or from_label_re.search(combined_prev)
+            ):
+                seen_from_label = True
+            elif seen_from_label and not seen_to_label and (
+                # 'To' alone, OR 'To Date'.
+                re.fullmatch(r"\s*to\s*", stripped, re.IGNORECASE)
+                or to_label_re.search(stripped)
+            ):
+                seen_to_label = True
+            # Once we've passed the headers, watch for the FIRST two
+            # standalone-date paragraphs.
+            if seen_from_label:
+                m = _DATE_ONLY_RE.fullmatch(stripped) or (
+                    _DATE_ONLY_RE.match(stripped) if _DATE_ONLY_RE.match(stripped)
+                    and _DATE_ONLY_RE.match(stripped).group(0) == stripped
+                    else None
+                )
+                if m:
+                    if result.from_date is None:
+                        _set_loc("from_date", order, text, m.group(0))
+                    elif result.to_date is None:
+                        _set_loc("to_date", order, text, m.group(0))
+                        break
+            prev_text = stripped
 
     # --- invoice_date
     # Prefer: a paragraph whose nearby label says "Invoice Date" / "Date".

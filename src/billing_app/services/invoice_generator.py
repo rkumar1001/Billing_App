@@ -16,6 +16,7 @@ rate / hours / guards) drive the updates; everything else is inferred.
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import date
@@ -37,8 +38,11 @@ from .auto_detect import (
     load_cache,
     save_cache,
 )
+from .auxiliary_excels import update_g703, update_payment_request_form
 from .calendar_util import MONTH_NAMES, days_in_month, month_name
-from .folder_analyzer import FolderAnalysis, analyze, rename_for_target
+from .folder_analyzer import (
+    FolderAnalysis, analyze, rename_for_target, swap_any_month_token,
+)
 from .xls_to_xlsx import XlsConvertError, convert_xls_to_xlsx
 
 
@@ -72,6 +76,7 @@ class GenerateResult:
     word_detection: WordDetection
     unresolved_excel: list[str] = field(default_factory=list)
     unresolved_word: list[str] = field(default_factory=list)
+    auxiliary_files: list[tuple[Path, str]] = field(default_factory=list)
 
 
 class GeneratorError(Exception):
@@ -240,7 +245,11 @@ def generate(req: GenerateRequest) -> GenerateResult:
     total_hours = round(n_days * hpd * guards, 2)
     grand_total = round(total_hours * rate, 2)
 
+    # Default form (e.g. "HART24"); we'll adapt to the doc's spacing
+    # (e.g. "HART 24") below if the source used a space.
     invoice_number_str = f"{analysis.invoice_prefix}{invoice_int}"
+    if word_det and word_det.invoice_number and " " in word_det.invoice_number.match_text:
+        invoice_number_str = f"{analysis.invoice_prefix} {invoice_int}"
 
     # Apply to Excel copy.
     unresolved_excel: list[str] = []
@@ -259,6 +268,9 @@ def generate(req: GenerateRequest) -> GenerateResult:
     if new_word is not None:
         period_string = _format_period(req.target_year, req.target_month)
         invoice_date_string = _format_invoice_date(req.invoice_date)
+        from_string, to_string = _format_period_endpoints(
+            req.target_year, req.target_month,
+        )
         unresolved_word = _update_word(
             new_word,
             word_det,
@@ -266,10 +278,65 @@ def generate(req: GenerateRequest) -> GenerateResult:
                 "invoice_number": invoice_number_str,
                 "invoice_date": invoice_date_string,
                 "billing_period": period_string,
+                "from_date": from_string,
+                "to_date": to_string,
                 "total_hours": _format_number(total_hours),
                 "grand_total": _format_currency(grand_total),
             },
         )
+
+    # Process auxiliary spreadsheets (PRF, G703) found alongside the main
+    # breakdown. We convert any .xls to .xlsx in place, swap the month
+    # token in the filename, and apply the role-specific edit recipe.
+    auxiliary_results: list[tuple[Path, str]] = []
+    for aux_src_path, role, aux_legacy in analysis.auxiliary_excels:
+        aux_in_target = target_folder / aux_src_path.name
+        if not aux_in_target.exists():
+            continue
+        # Convert .xls -> .xlsx in target if needed.
+        if aux_legacy:
+            try:
+                xlsx_path = aux_in_target.with_suffix(".xlsx")
+                convert_xls_to_xlsx(aux_in_target, xlsx_path)
+                try:
+                    aux_in_target.unlink()
+                except OSError:
+                    pass
+                aux_in_target = xlsx_path
+            except XlsConvertError:
+                continue  # skip this auxiliary on conversion failure
+        # Rename: swap any month token found in the filename. Auxiliary
+        # forms often have stale month tags ("...February.xlsx") that
+        # don't match the folder's month token, so scan all months.
+        new_name = swap_any_month_token(aux_in_target.name, req.target_month)
+        renamed = aux_in_target
+        if new_name != aux_in_target.name:
+            renamed = aux_in_target.with_name(new_name)
+            try:
+                aux_in_target.rename(renamed)
+            except OSError:
+                renamed = aux_in_target
+        # Apply role-specific edits.
+        try:
+            if role == "payment_request_form":
+                update_payment_request_form(
+                    renamed,
+                    target_year=req.target_year,
+                    target_month=req.target_month,
+                    invoice_date=req.invoice_date,
+                )
+            elif role == "g703":
+                update_g703(
+                    renamed,
+                    target_year=req.target_year,
+                    target_month=req.target_month,
+                    invoice_date=req.invoice_date,
+                    invoice_number_str=invoice_number_str,
+                )
+        except Exception:  # noqa: BLE001
+            # Don't fail the whole generate if one auxiliary file blows up.
+            pass
+        auxiliary_results.append((renamed, role))
 
     # Write cache back into the SOURCE folder so next run is fast.
     try:
@@ -291,6 +358,7 @@ def generate(req: GenerateRequest) -> GenerateResult:
         word_detection=word_det,
         unresolved_excel=unresolved_excel,
         unresolved_word=unresolved_word,
+        auxiliary_files=auxiliary_results,
     )
 
 
@@ -359,6 +427,35 @@ def _update_excel(
                     _swap_year_in_formulas(
                         ws, det.detected_year, target_year,
                     )
+            elif det.text_dates and det.text_date_format:
+                # Template uses plain text strings for dates ("Wednesday,
+                # April-1 ,2026" etc.). Re-render each row using the
+                # detected strftime format.
+                for i in range(target_days):
+                    d = date(target_year, target_month, i + 1)
+                    ws.cell(
+                        row=start_row + i, column=col_idx,
+                        value=d.strftime(det.text_date_format),
+                    )
+                # Trim leftover rows from a longer source month.
+                source_days = det.dates_row_end and (det.dates_row_end - start_row + 1) or target_days
+                if source_days > target_days:
+                    for i in range(target_days, source_days):
+                        ws.cell(row=start_row + i, column=col_idx).value = None
+                # Extend other columns (hours/guards/rate/etc.) for newly
+                # added rows by copying the last source row's values forward.
+                if target_days > source_days:
+                    last_src_row = start_row + source_days - 1
+                    for i in range(source_days, target_days):
+                        new_row = start_row + i
+                        for col in range(1, ws.max_column + 1):
+                            if col == col_idx:
+                                continue
+                            src = ws.cell(row=last_src_row, column=col)
+                            dst = ws.cell(row=new_row, column=col)
+                            if src.value is not None:
+                                dst.value = src.value
+                                _copy_cell_style(src, dst)
             else:
                 # Write new-month dates literally.
                 for i in range(target_days):
@@ -396,8 +493,23 @@ def _update_word(
     # super-paragraph that encloses text frames.
     leaf_paragraphs = list(_leaf_paragraph_elements(doc))
 
-    for field_name in ("invoice_number", "invoice_date", "billing_period",
-                       "total_hours", "grand_total"):
+    # Hartford-style invoices use a multi-row line-items table where every
+    # row repeats the same from/to dates and has its own per-row total. The
+    # user wants only the dates updated; per-row hours/amounts/totals stay.
+    hartford_style = det.from_date is not None or det.to_date is not None
+
+    fields_to_apply = ["invoice_number", "invoice_date"]
+    if det.billing_period is not None:
+        fields_to_apply.append("billing_period")
+    if det.from_date is not None:
+        fields_to_apply.append("from_date")
+    if det.to_date is not None:
+        fields_to_apply.append("to_date")
+    # Only update totals when this is NOT a multi-row Hartford-style doc.
+    if not hartford_style:
+        fields_to_apply.extend(["total_hours", "grand_total"])
+
+    for field_name in fields_to_apply:
         loc: WordLoc | None = getattr(det, field_name)
         value = values.get(field_name, "")
         if loc is None:
@@ -581,10 +693,15 @@ def _splice_runs(runs, start: int, end: int, new: str) -> None:
 
 
 def _format_period(year: int, month: int) -> str:
+    start, end = _format_period_endpoints(year, month)
+    return f"{start} – {end}"
+
+
+def _format_period_endpoints(year: int, month: int) -> tuple[str, str]:
     fmt = "%#m/%#d/%Y" if platform.system() == "Windows" else "%-m/%-d/%Y"
     start = date(year, month, 1).strftime(fmt)
     end = date(year, month, days_in_month(year, month)).strftime(fmt)
-    return f"{start} – {end}"
+    return start, end
 
 
 def _format_invoice_date(d: date) -> str:
