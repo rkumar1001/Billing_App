@@ -72,6 +72,9 @@ class ExcelDetection:
             "dates_column_start": self.dates_column_start,
             "dates_row_end": self.dates_row_end,
             "legacy_xls": self.legacy_xls,
+            "formula_dates": self.formula_dates,
+            "text_dates": self.text_dates,
+            "text_date_format": self.text_date_format,
         }
 
     @classmethod
@@ -83,6 +86,9 @@ class ExcelDetection:
             dates_column_start=data.get("dates_column_start"),
             dates_row_end=data.get("dates_row_end"),
             legacy_xls=bool(data.get("legacy_xls", False)),
+            formula_dates=bool(data.get("formula_dates", False)),
+            text_dates=bool(data.get("text_dates", False)),
+            text_date_format=str(data.get("text_date_format", "")),
         )
 
 
@@ -301,11 +307,43 @@ def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
                     result.detected_month = run_month
                     result.detected_year = run_year
 
-        # If we didn't find a literal-date column, try a text-date column.
-        # Templates like the Hartford breakdown store the daily date as a
-        # plain text string (e.g. " Wednesday, April-1 ,2026") rather than a
-        # date-typed cell or a formula. The text follows a recognisable
-        # pattern: <Weekday>, <Month>-<Day> ,<Year>.
+        # If no literal-date column, check for formula-driven dates BEFORE
+        # text-date detection — the Hartford-style template uses
+        # =TEXT(DATE(...)) formulas whose cached display value is a string,
+        # which would otherwise mis-trigger the text-date branch.
+        if result.dates_column_start is None:
+            formula_wb = load_workbook(filename=str(xlsx_path), data_only=False)
+            try:
+                ws_raw = formula_wb[ws.title] if ws.title in formula_wb.sheetnames else formula_wb.active
+                first_formula_row: int | None = None
+                last_formula_row: int | None = None
+                for col in range(1, 12):
+                    first_formula_row = None
+                    last_formula_row = None
+                    for row in range(1, 60):
+                        v = ws_raw.cell(row=row, column=col).value
+                        if isinstance(v, str) and v.startswith("=") and "DATE(" in v.upper():
+                            if first_formula_row is None:
+                                first_formula_row = row
+                            last_formula_row = row
+                    if first_formula_row is not None and last_formula_row - first_formula_row >= 5:
+                        col_letter = get_column_letter(col)
+                        result.dates_column_start = f"{col_letter}{first_formula_row}"
+                        result.dates_row_end = last_formula_row
+                        result.formula_dates = True
+                        sample = ws_raw.cell(
+                            row=first_formula_row, column=col,
+                        ).value or ""
+                        ym = re.search(r"DATE\(\s*\"?(\d{4})", sample)
+                        if ym:
+                            result.detected_year = int(ym.group(1))
+                        break
+            finally:
+                formula_wb.close()
+
+        # If neither literal nor formula dates, try a plain text-date column.
+        # Templates that bake the date into a string (e.g. " Wednesday,
+        # April-1 ,2026") fall here.
         if result.dates_column_start is None:
             text_date_re = re.compile(
                 r"\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*\s*,\s*"
@@ -365,44 +403,6 @@ def _detect_xlsx(xlsx_path: Path) -> ExcelDetection:
                                 result.detected_month = idx
                                 break
                     break
-
-        # If we still didn't find a dates column, try formula-based dates.
-        # Templates like the Bella Vista breakdown drive the date column from
-        # =TEXT(DATE(year, $K$2, A_), ...) formulas, so the cell values are
-        # text strings (Wednesday, April-1 ,2026) but the column STILL acts
-        # as the dates column once we know it. Detect by scanning column B
-        # for that formula pattern in the workbook loaded WITHOUT data_only.
-        if result.dates_column_start is None:
-            formula_wb = load_workbook(filename=str(xlsx_path), data_only=False)
-            try:
-                ws_raw = formula_wb[ws.title] if ws.title in formula_wb.sheetnames else formula_wb.active
-                first_formula_row: int | None = None
-                last_formula_row: int | None = None
-                for col in range(1, 12):
-                    first_formula_row = None
-                    last_formula_row = None
-                    for row in range(1, 60):
-                        v = ws_raw.cell(row=row, column=col).value
-                        if isinstance(v, str) and v.startswith("=") and "DATE(" in v.upper():
-                            if first_formula_row is None:
-                                first_formula_row = row
-                            last_formula_row = row
-                    if first_formula_row is not None and last_formula_row - first_formula_row >= 5:
-                        col_letter = get_column_letter(col)
-                        result.dates_column_start = f"{col_letter}{first_formula_row}"
-                        result.dates_row_end = last_formula_row
-                        result.formula_dates = True
-                        # Try to read the year out of the formula text so the
-                        # update step knows whether to swap years.
-                        sample = ws_raw.cell(
-                            row=first_formula_row, column=col,
-                        ).value or ""
-                        ym = re.search(r"DATE\(\s*\"?(\d{4})", sample)
-                        if ym:
-                            result.detected_year = int(ym.group(1))
-                        break
-            finally:
-                formula_wb.close()
 
         # Read rate, hours per day, guards from the first date row.
         if result.dates_column_start:

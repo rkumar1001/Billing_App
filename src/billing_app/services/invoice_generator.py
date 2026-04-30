@@ -116,6 +116,10 @@ def preview(source: Path) -> tuple[FolderAnalysis, ExcelDetection | None, WordDe
             excel_det.hourly_rate = detected.hourly_rate
             excel_det.hours_per_day = detected.hours_per_day
             excel_det.guards = detected.guards
+            excel_det.formula_dates = detected.formula_dates
+            excel_det.text_dates = detected.text_dates
+            excel_det.text_date_format = detected.text_date_format
+            excel_det.legacy_xls = detected.legacy_xls
 
     if analysis.word_path and analysis.invoice_number is not None:
         invoice_str = f"{analysis.invoice_prefix}{analysis.invoice_number}"
@@ -411,51 +415,32 @@ def _update_excel(
             col_letter, start_row = coordinate_from_string(det.dates_column_start)
             col_idx = _col_to_index(col_letter)
             target_days = days_in_month(target_year, target_month)
-            if det.formula_dates:
-                # Template uses =TEXT(DATE(YYYY, $K$_, A_)) formulas — the
-                # date column auto-regenerates from the month cell we just
-                # wrote above. We only need to (a) extend or trim data rows
-                # so totals cover exactly target_days, and (b) swap the
-                # hardcoded year if the user moved into a new year.
-                _adjust_formula_rows(
+            if det.formula_dates or (det.text_dates and det.text_date_format):
+                # Both formula-driven and text-date templates often have
+                # per-day values that depend on weekday (e.g. Sundays at a
+                # different rate). Rearrange rows so each weekday in the
+                # target month gets the source-month's matching weekday
+                # template; the date column itself either auto-regenerates
+                # via formula (formula_dates) or gets a fresh text string
+                # (text_dates).
+                source_year = det.detected_year or target_year
+                source_month = det.detected_month or source_month or target_month
+                _rebuild_rows_by_weekday(
                     ws,
+                    col_idx=col_idx,
                     start_row=start_row,
-                    last_row=det.dates_row_end or (start_row + target_days - 1),
+                    source_last_row=det.dates_row_end or (start_row + target_days - 1),
+                    source_year=source_year,
+                    source_month=source_month,
+                    target_year=target_year,
+                    target_month=target_month,
                     target_days=target_days,
+                    text_date_format=det.text_date_format if det.text_dates else "",
                 )
-                if det.detected_year and det.detected_year != target_year:
+                if det.formula_dates and det.detected_year and det.detected_year != target_year:
                     _swap_year_in_formulas(
                         ws, det.detected_year, target_year,
                     )
-            elif det.text_dates and det.text_date_format:
-                # Template uses plain text strings for dates ("Wednesday,
-                # April-1 ,2026" etc.). Re-render each row using the
-                # detected strftime format.
-                for i in range(target_days):
-                    d = date(target_year, target_month, i + 1)
-                    ws.cell(
-                        row=start_row + i, column=col_idx,
-                        value=d.strftime(det.text_date_format),
-                    )
-                # Trim leftover rows from a longer source month.
-                source_days = det.dates_row_end and (det.dates_row_end - start_row + 1) or target_days
-                if source_days > target_days:
-                    for i in range(target_days, source_days):
-                        ws.cell(row=start_row + i, column=col_idx).value = None
-                # Extend other columns (hours/guards/rate/etc.) for newly
-                # added rows by copying the last source row's values forward.
-                if target_days > source_days:
-                    last_src_row = start_row + source_days - 1
-                    for i in range(source_days, target_days):
-                        new_row = start_row + i
-                        for col in range(1, ws.max_column + 1):
-                            if col == col_idx:
-                                continue
-                            src = ws.cell(row=last_src_row, column=col)
-                            dst = ws.cell(row=new_row, column=col)
-                            if src.value is not None:
-                                dst.value = src.value
-                                _copy_cell_style(src, dst)
             else:
                 # Write new-month dates literally.
                 for i in range(target_days):
@@ -534,6 +519,127 @@ def _update_word(
 
     doc.save(str(path))
     return unresolved
+
+
+def _rebuild_rows_by_weekday(
+    ws,
+    *,
+    col_idx: int,
+    start_row: int,
+    source_last_row: int,
+    source_year: int,
+    source_month: int,
+    target_year: int,
+    target_month: int,
+    target_days: int,
+    text_date_format: str = "",
+) -> None:
+    """Rebuild the per-day rows so each row in the target month is
+    populated from the source row that matches its WEEKDAY.
+
+    Many templates have per-day values that vary by weekday (Hartford
+    keeps hours=24 / no Lift Operator on Sundays; weekdays at hours=14).
+    Position-only date shifting silently misaligns these values once the
+    source and target months start on different weekdays. This function
+    fixes that by:
+
+      1. Snapshotting each source row's values, keyed by the weekday
+         derived from (source_year, source_month, day-position).
+      2. For each target row position, picking the source-row snapshot
+         that matches the target row's weekday (with a wrap-around
+         fallback if a weekday is absent from the source).
+      3. Writing the snapshot into the target row, rewriting row
+         references inside formulas (e.g. ``C17`` -> ``C8``) and writing
+         the day number as a literal int. The date column itself is
+         either rewritten as text (text_dates) or left alone so the
+         template's date formula auto-regenerates (formula_dates).
+      4. Blanking out trailing rows when the target month is shorter.
+
+    Source-row positions follow ``start_row + (day - 1)`` — we infer the
+    weekday from the position rather than parsing each cell, so this
+    works equally well for formula-driven and text-driven date columns.
+    """
+    import re as _re
+    max_col = ws.max_column
+
+    # Step 1: snapshot source rows by weekday.
+    templates: dict[int, tuple[int, list[Any]]] = {}
+    last_snapshot: list[Any] | None = None
+    last_src_row = source_last_row
+    for row in range(start_row, source_last_row + 1):
+        day = row - start_row + 1
+        try:
+            wd = date(source_year, source_month, day).weekday()
+        except ValueError:
+            continue  # day too high for source month
+        snapshot = [ws.cell(row=row, column=c).value for c in range(1, max_col + 1)]
+        if wd not in templates:
+            templates[wd] = (row, snapshot)
+        last_snapshot = snapshot
+        last_src_row = row
+
+    if not templates:
+        # No source rows? Just write dates if we know how, then bail.
+        if text_date_format:
+            for i in range(target_days):
+                d = date(target_year, target_month, i + 1)
+                ws.cell(
+                    row=start_row + i, column=col_idx,
+                    value=d.strftime(text_date_format),
+                )
+        return
+
+    # Step 2 + 3: write each target row from its weekday's template.
+    for i in range(target_days):
+        target_row = start_row + i
+        target_date = date(target_year, target_month, i + 1)
+        wd = target_date.weekday()
+        if wd in templates:
+            src_row_index, src_values = templates[wd]
+        else:
+            for offset in range(1, 7):
+                candidate = (wd + offset) % 7
+                if candidate in templates:
+                    src_row_index, src_values = templates[candidate]
+                    break
+            else:
+                src_row_index = last_src_row
+                src_values = last_snapshot or [None] * max_col
+        for c in range(1, max_col + 1):
+            v = src_values[c - 1]
+            target_cell = ws.cell(row=target_row, column=c)
+            if c == 1:
+                # Item-number column — always literal day number.
+                target_cell.value = i + 1
+            elif c == col_idx:
+                if text_date_format:
+                    target_cell.value = target_date.strftime(text_date_format)
+                else:
+                    # formula_dates: copy source formula, rewrite refs.
+                    if isinstance(v, str) and v.startswith("="):
+                        target_cell.value = _re.sub(
+                            rf"(\$?[A-Z]+\$?){src_row_index}\b",
+                            rf"\g<1>{target_row}",
+                            v,
+                        )
+                    else:
+                        target_cell.value = v
+            elif isinstance(v, str) and v.startswith("="):
+                target_cell.value = _re.sub(
+                    rf"(\$?[A-Z]+\$?){src_row_index}\b",
+                    rf"\g<1>{target_row}",
+                    v,
+                )
+            else:
+                target_cell.value = v
+            src_style_cell = ws.cell(row=src_row_index, column=c)
+            _copy_cell_style(src_style_cell, target_cell)
+
+    # Step 4: blank out leftover trailing rows.
+    if source_last_row > start_row + target_days - 1:
+        for row in range(start_row + target_days, source_last_row + 1):
+            for c in range(1, max_col + 1):
+                ws.cell(row=row, column=c).value = None
 
 
 def _adjust_formula_rows(ws, *, start_row: int, last_row: int, target_days: int) -> None:
